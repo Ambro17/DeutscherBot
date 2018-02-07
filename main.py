@@ -6,25 +6,26 @@ import os
 import json
 import time
 
-from lxml.html import fragments_fromstring, HtmlElement
+from lxml.html import fragments_fromstring, fragment_fromstring, HtmlElement
+from lxml import etree
 import praw
 
-from config import (
-    PONS_KEY,
+import config
+from exceptions import (
+    DeutscherBotException,
+    CouldNotGetText,
+    SearchError,
+    TranslationException,
 )
-
 DB_PATH = os.path.join(os.path.dirname(__file__), 'db')
 
 STATUS_TO_REASON = {
-    200: "Request successful", 204: "No results could be found",
+    200: "Request successful",
+    204: "No results could be found for the given word",
     404: "The dictionary does not exist",
     403: "Supplied credentials could not be verified, or access to dictionary denied",
     500: "A server error has occurred", None: "Unknown error (sorry)"
 }
-
-class SearchError(Exception):
-    def __init__(self, message):
-        self.message = message
 
 class Pons(object):
     API_BASE_URL = 'https://api.pons.com/v1/dictionary'
@@ -32,7 +33,7 @@ class Pons(object):
     SEARCH_STRING = 'q'
     INPUT_LANG = 'in'
     SEARCH_URL = "https://en.pons.com/translate?q={word}&l=deen&in=de&language=en"
-    auth = {'X-Secret': PONS_KEY}
+    auth = {'X-Secret': config.PONS_KEY}
 
     def search(self, word):
         """Receives a word and returns the result of pons dictionary."""
@@ -47,43 +48,44 @@ class Pons(object):
             error_msg = STATUS_TO_REASON.get(status)
             raise SearchError(error_msg)
 
-class DeutschesBot():
+class DeutscherBot():
     """Given a word it returns it's gender, translation, and a usage example."""
-    dbot = praw.Reddit("dbot")
+    dbot = praw.Reddit("DeutscherBot")
     BREAK_LINE = '\n\n'
     BLANK_LINE = BREAK_LINE + '&nbsp;' + BREAK_LINE
     COMMENT_TEMPLATE = (
         "{article_and_word} {phonetics} | {word_type}" + BLANK_LINE +
-        " 🇩🇪 {word} ➡ 🇬🇧 {translation}" + BLANK_LINE +
-        " {source_link}" # + {example}
+        "🇩🇪 {word} 🔁 🇬🇧 {translation}" + BLANK_LINE +
+        "{source_link}" # + {example}
         )
 
-    db_connection = sqlite3.connect(os.path.join(DB_PATH, 'posts.db'),
+    db_connection = sqlite3.connect(os.path.join(DB_PATH, 'posts2.db'),
                                     detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
 
-    def __init__(self, subreddit='DeutschesBot'):
+    def __init__(self, subreddit='DeutschesBot', create_db = False):
         self.pons = Pons()
         self.subreddit = self.dbot.subreddit(subreddit)
         self.db_cursor = self.db_connection.cursor()
-        #self.db_cursor.execute('''CREATE TABLE posts(
-        #    post_id, link, word, translation, raw_result, date, subreddit)''')
+        if create_db:
+            self.db_cursor.execute('''CREATE TABLE posts(
+                post_id, link, word, translation, raw_result, date, subreddit)''')
 
     def scan_posts(self, cant=5):
         print(f"Visting /r/{self.subreddit}")
-        for post in self.subreddit.new(limit=5):
+        for post in self.subreddit.new(limit=cant):
             print(f"Visiting {post.title}")
             if not self.visited_db(post):
                 word = self._get_word_to_search(post)
-                word_details = self.lookup_word(word)
-                print(f"word details {json.dumps(word_details)}")
+                word_details = self.search_word(word)
                 definition = self.prepare_comment(word_details)
                 post.reply(definition)
                 print(f"Replied on https://reddit.com/{post.id}")
                 self.add_to_db(post, word_details)
+                delay = 20
             else:
                 print(f"Skipping '{post.title}', already visited")
+                delay = 5
 
-            delay = 90
             print(f"Sleeping for {delay} seconds...")
             time.sleep(delay)
 
@@ -92,27 +94,28 @@ class DeutschesBot():
     def _get_word_to_search(self, post):
         """Extract last word from post title.
 
-        Format is Wort of the day: <word>
+        Format is
+            Wort of the hour: <word>
         """
+        # Split Words
         words = post.title.split()
+        # Get last word without spaces
         word = words[-1].strip()
         return word
 
-    def lookup_word(self, s_word):
+    def search_word(self, s_word):
         search_result = dict()
         try:
             result = self.pons.search(s_word)
         except SearchError:
-            raise RuntimeError(f"Error searching {word}")
+            raise DeutscherBotException(f"Error searching {s_word}")
 
         # Get Most relevant result.
         result = result['hits'][0]
         if result['type'] == 'entry':
             definition = result['roms'][0]
-            print(json.dumps(definition))
         else:
-            return None
-            raise NotImplementedError("Translations are not yet supported")
+            raise TranslationException("Translations are not yet supported")
         # Get result word
         word = definition['headword'].replace('·','') # remove syllable separator if present
         search_result['word'] = word
@@ -144,13 +147,16 @@ class DeutschesBot():
     LETTER_TO_ARTICLE_MAPPER = {
         'nt': 'das',
         'm': 'der',
-        'f': 'die',
-        None: None
+        'f': 'die'
     }
     def prepare_comment(self, word_result):
-        article = self.LETTER_TO_ARTICLE_MAPPER[word_result.get('gender')]
+        try:
+            article = self.LETTER_TO_ARTICLE_MAPPER[word_result.get('gender', '')]
+        except KeyError:
+            # Word has no article (is verb, adverb, adjective or similar)
+            article=''
         word = word_result.get('word')
-        word_w_article = article+word if article else word
+        word_w_article = article+' '+word if article else word
         word_type = word_result.get('word_type').title()
         phonetics = str(word_result['metadata'].get('phonetics', ''))
         translation = word_result['translation']
@@ -161,6 +167,7 @@ class DeutschesBot():
             article_and_word=self.bold(word_w_article),
             phonetics=phonetics,
             word_type=self.italics(word_type) or None,
+            word = word,
             translation=translation,
             source_link=source,
         )
@@ -212,7 +219,7 @@ class DeutschesBot():
                 inner_text = elem.text_content()
                 text += self.parenthesis(self.italics(inner_text))
             else:
-                raise Exception(f"No method to extract text from {elem}"
+                raise CouldNotGetText(f"No method to extract text from {elem}"
                                 f" of type {type(elem)} to string")
 
         return text
@@ -224,12 +231,13 @@ class DeutschesBot():
         """
         # Build list of html elements, ignoring leading string.
         html_elem = fragments_fromstring(fullword)[1:]
-        details = {
-            elem.get('class'):elem.text_content()
-            for elem in html_elem
-        }
+        metadata = {}
+        for elem in html_elem:
+            key = elem.get('class')
+            if key not in metadata:
+                metadata[key] = elem.text_content()
 
-        return details
+        return metadata
 
     def add_to_db(self, post, word_details):
         word = word_details['word']
@@ -237,9 +245,9 @@ class DeutschesBot():
         raw_result = json.dumps(word_details)
         now = d.now()
         self.db_cursor.execute("""INSERT INTO posts(
-            post_id, link, word, translation, raw_result, date)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (post.id, post.url, word, translation, raw_result, now))
+            post_id, link, word, translation, raw_result, date, subreddit)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (post.id, post.url, word, translation, raw_result, now, str(self.subreddit)))
 
         self.db_connection.commit()
 
@@ -264,18 +272,28 @@ class DeutschesBot():
     def parenthesis(self, astr):
         return f"({astr})"
 
-DeutschesBot("DeutschesBot").scan_posts()
+DeutscherBot("Sprache").scan_posts(cant=20)
 
-""""
-dbot = DeutschesBot()
-wordlist = ['Datum','Wunde', 'Zement','tisch','Zeit','handy','rennen','sicherheit','scheisse','gross', 'gegen', 'problem']
-another = ['Datum', 'Gold', 'Wahr', 'Barsch', 'Tool', 'Multiplikation', 'Misserfolg', 'Verbal', 'Kabel', 'Fäulnis', 'Inhalt',
-           'Wiege', 'Feierlich', 'Vers', 'Ausmaß','Kriminelle', 'Kandidatin', 'Energie', 'Vertikal', 'Tropisch', 'Dach', 'Urkunde']
+"""
+dbot = DeutscherBot()
 
 
-# Ausmaß, Kandidatin
-print(f"words to search {len(another)}")
-for word in another:
-    result = dbot.lookup_word(word)
-    print(json.dumps(result, indent=2))
+words3 = sample_200 = ['Vermeidet', 'Western', 'Ordner', 'Konzil', 'Vorsichtig', 'Hört', 'Gewaltsam', 'Dampf', 'Sklave', 'Preis', 'Bibel', 'Review', 'Ein', 'Durcheinander', 'Bejahend', 'Ornament', 'Zügig', 'Gelb', 'Gefängnis', 'Orange', 'Zutiefst', 'Bronze', 'Hoffnung', 'Firma', 'Andacht', 'Reif', 'Verwandt', 'Zerstört', 'Speer', 'Nacht', 'Flamme', 'Kombination', 'Unterbrechung', 'Betont', 'Schlimm', 'Sicherheit', 'Vorsilbe', 'Reich', 'Sicher', 'Rückenseitig', 'Journal', 'Caritas', 'Geschenk', 'Verbringt', 'Vater', 'Symmetrisch', 'Unmut', 'Lösbar', 'Zügelt', 'Pfiffig', 'Besitzt', 'Stift', 'Verbaut', 'Literarisch', 'Theorie', 'Abhilfe', 'Methode', 'Geschmack', 'Bündel', 'Schlacht', 'Nase', 'More', 'Sprungweite', 'Hube', 'Wachst', 'Treu', 'Ente', 'Sorglos', 'Darm', 'überredung/überredung', 'Periodisch', 'Geständnis', 'Nummer', 'Realität', 'Närrisch', 'An', 'Verdauung', 'Tiefe', 'Betrüger', 'Vertrag', 'Spekulation', 'Komparativ', 'Vollendeten', 'Tausend', 'Symmetrie', 'Kräftig', 'Angenehm', 'überwindet', 'Schlich', 'Appetit', 'Orchester', 'Rede', 'Debatte', 'Begeht', 'Real', 'Schwerkraft', 'Ungelenk', 'Duft', 'Irrtümlich', 'Straßengraben', 'Hilfsverb', 'Droben', 'Leicht', 'Geschickt', 'Abfolge', 'ähnelt', 'Kraftvoll', 'Wohlüberlegt', 'Geradheit', 'Bart', 'Wärme', 'Still', 'Region', 'Belegt', 'Mitte', 'Rille', 'Wappen', 'Flasche', 'Stattet', 'Kader', 'Name', 'Staub', 'Leiter', 'Gelegenheit', 'Seicht', 'Moralisch', 'Feindlich', 'Trügt', 'Koppelt', 'Geschicklichkeit', 'Zivil', 'Metallisch', 'Chemikalie', 'Klasse', 'Moment', 'Expandiert', 'Motor', 'Besiegung', 'Burg', 'Gehört', 'Leere', 'Baum', 'Versetzung', 'Fond', 'Scheibe', 'Blattwerk', 'Erfolg', 'Bund', 'Zimmer', 'Folter', 'Portion', 'Vorgesehen', 'Verstoß', 'Streng', 'Bleistift', 'Betrügt', 'Weiterhin', 'An', 'Wahr', 'Tool', 'Gold', 'Datum', 'Barsch', 'Multiplikation', 'Wiege', 'Zement', 'Misserfolg', 'Wunde', 'Vers', 'Fäulnis', 'Kabel', 'Verbal', 'Inhalt', 'Vertikal', 'Tropisch', 'Kandidatin', 'Kriminelle', 'Feierlich', 'Ausmaß', 'Energie', 'Schaden', 'Umher', 'Urkunde', 'Dach', 'Mahlzeit', 'Männchen', 'Schenkel', 'Entgelt', 'Schüssel', 'Auswertung', 'Defekt', 'Angemessen', 'Krankheit', 'Heck', 'Olive', 'Norden', 'Stuhl', 'Offen', 'Prozession', 'Kohlkopf']
+sample_500 = ['öffentlich', 'Vermeidet', 'Western', 'Ordner', 'Konzil', 'Vorsichtig', 'Hört', 'Gewaltsam', 'Dampf', 'Sklave', 'Preis', 'Bibel', 'Review', 'Ein', 'Durcheinander', 'Bejahend', 'Ornament', 'Zügig', 'Gelb', 'Gefängnis', 'Orange', 'Zutiefst', 'Bronze', 'Hoffnung', 'Firma', 'Andacht', 'Reif', 'Verwandt', 'Zerstört', 'Speer', 'Nacht', 'Flamme', 'Kombination', 'Unterbrechung', 'Betont', 'Schlimm', 'Sicherheit', 'Vorsilbe', 'Reich', 'Sicher', 'Rückenseitig', 'Journal', 'Caritas', 'Geschenk', 'Verbringt', 'Vater', 'Symmetrisch', 'Unmut', 'Lösbar', 'Zügelt', 'Pfiffig', 'Besitzt', 'Stift', 'Verbaut', 'Literarisch', 'Theorie', 'Abhilfe', 'Methode', 'Geschmack', 'Bündel', 'Schlacht', 'Nase', 'More', 'Sprungweite', 'Hube', 'Wachst', 'Treu', 'Ente', 'Sorglos', 'Darm', 'überredung/überredung', 'Periodisch', 'Geständnis', 'Nummer', 'Realität', 'Närrisch', 'An', 'Verdauung', 'Tiefe', 'Betrüger', 'Vertrag', 'Spekulation', 'Komparativ', 'Vollendeten', 'Tausend', 'Symmetrie', 'Kräftig', 'Angenehm', 'überwindet', 'Schlich', 'Appetit', 'Orchester', 'Rede', 'Debatte', 'Begeht', 'Real', 'Schwerkraft', 'Ungelenk', 'Duft', 'Irrtümlich', 'Straßengraben', 'Hilfsverb', 'Droben', 'Leicht', 'Geschickt', 'Abfolge', 'ähnelt', 'Kraftvoll', 'Wohlüberlegt', 'Geradheit', 'Bart', 'Wärme', 'Still', 'Region', 'Belegt', 'Mitte', 'Rille', 'Wappen', 'Flasche', 'Stattet', 'Kader', 'Name', 'Staub', 'Leiter', 'Gelegenheit', 'Seicht', 'Moralisch', 'Feindlich', 'Trügt', 'Koppelt', 'Geschicklichkeit', 'Zivil', 'Metallisch', 'Chemikalie', 'Klasse', 'Moment', 'Expandiert', 'Motor', 'Besiegung', 'Burg', 'Gehört', 'Leere', 'Baum', 'Versetzung', 'Fond', 'Scheibe', 'Blattwerk', 'Erfolg', 'Bund', 'Zimmer', 'Folter', 'Portion', 'Vorgesehen', 'Verstoß', 'Streng', 'Bleistift', 'Betrügt', 'Weiterhin', 'An', 'Wahr', 'Tool', 'Gold', 'Datum', 'Barsch', 'Multiplikation', 'Wiege', 'Zement', 'Misserfolg', 'Wunde', 'Vers', 'Fäulnis', 'Kabel', 'Verbal', 'Inhalt', 'Vertikal', 'Tropisch', 'Kandidatin', 'Kriminelle', 'Feierlich', 'Ausmaß', 'Energie', 'Schaden', 'Umher', 'Urkunde', 'Dach', 'Mahlzeit', 'Männchen', 'Schenkel', 'Entgelt', 'Schüssel', 'Auswertung', 'Defekt', 'Angemessen', 'Krankheit', 'Heck', 'Olive', 'Norden', 'Stuhl', 'Offen', 'Prozession', 'Kohlkopf', 'Freundlich', 'Loch', 'Begeisterung', 'Opponiert', 'Gefüge', 'Genug', 'Begierde', 'Verteidigt', 'Betrag', 'Schulter', 'Jahr', 'Wartezeit', 'Sand', 'Ritt', 'Mond', 'Hauptsächlich', 'Schicht', 'Segeltuch', 'Fähig', 'Gegenwert', 'Scham', 'Rezeption', 'Bohle', 'Winkel', 'umwerfend', 'Involviert', 'Petition', 'Muskulös', 'Medizin', 'Unwahrheit', 'Ständig', 'Geheimnis', 'Auswuchs', 'An', 'Erzählt', 'Weh', 'Adrett', 'Looping', 'Transport', 'Günstig', 'Freiheit', 'Day!', 'Anspruch', 'Erlaubt', 'Folgend', 'Irdisch', 'Himmlisch', 'Marinesoldat', 'Aufregung', 'Kantig', 'Einbuße', 'Narr', 'Glück', 'Drüse', 'Truhe', 'Militär', 'Bad', 'Messing', 'Belohnung', 'Glaube', 'Kasse', 'Zuverlässig', 'Handfläche', 'Spät', 'Cord', 'Andernfalls', 'Allgemein', 'Extensiv', 'Mangelhaft', 'Aufrecht', 'Diener', 'Bitte', 'Jagd', 'Mittelbar', 'Königreich', 'Fremd', 'Würde', 'Aufsicht', 'Inversion', 'Geruch', 'Nobel', 'Nackt', 'Großartig', 'Vision', 'Verkehr', 'Spezies', 'Belegten', 'Hin', 'Abwärts', 'Konfusion', 'Gewöhnlich', 'Papiertaschentuch', 'Polin', 'Weibchen', 'Ab', 'An', 'Rose', 'Krabbe', 'Konus', 'Erkältung', 'Kühn', 'Furunkel', 'Unterschieden', 'Gedanke', 'Auf', 'Entzückung', 'Gewiss', 'Denkt', 'Grat', 'Praktisch', 'Ruhm', 'Tanz', 'Chef', 'Legierung', 'Instrumental', 'Zurück', 'Thron', 'Stigma', 'Geschmack', 'Himmel', 'Kies', 'Vorrichtung', 'Jährlich', 'Wand', 'Saat', 'Nelke', 'Milch', 'Dame', 'Angst', 'Ruhe', 'Kahl', 'Teilweise', 'Unbedeutend', 'Identisch', 'Haushalt', 'Genugtuung', 'Fund', 'Helm', 'Fördert', 'Sukzessiv', 'Gärt', 'Kompakt', 'Vereint', 'Paste', 'Nasal', 'Pflege', 'Umfassung', 'Innere', 'Belehrt', 'Abschätzung', 'Würdig', 'Stall', 'Streng', 'Profit', 'Zu', 'Yard', 'Röhre', 'Ruin', 'Gerade', 'Unterbrechung', 'Schein', 'Eigenwillig', 'Sammelt', 'Student', 'Spezial', 'Intensiv', 'Jahrhundert', 'Süden', 'Sauber', 'Klinge', 'Apparatur', 'Gemeinschaft', 'Wehrt', 'Kaufmann', 'Häufig', 'Doktrin', 'Konstante', 'Versammlung', 'Wasser', 'Unter', 'Andauernd', 'äußerung/äußerung', 'Fertig', 'Fossil', 'Baumwolle', 'Fungiert', 'Ein', 'Schuss', 'Bauernhof', 'Bulle', 'Deprimierten', 'Meister', 'Ein', 'Elegant', 'Steif', 'Musik', 'Geld', 'Fest', 'Uhr', 'Alarm', 'Aufschrift', 'Direkt', 'Definitiv', 'Cover', 'Tugend', 'Gesellschaftlich', 'Abfall', 'Priester', 'Niedrig', 'Wald', 'Ganz', 'Vergrößert', 'Holz', 'Klug', 'Langsam', 'Pein', 'Konventionell', 'Wichtig', 'Verschieden', 'Gewohnheitsmäßig', 'Kontinuierlich', 'Anlehnung', 'Seltsam', 'Zweck', 'Ein', 'Ehemann', 'Sprecht', 'Intention', 'Arbeitsgang', 'Richterlich', 'Gesinnt', 'Anhänger', 'Gift', 'Gefahr', 'übermittelt', 'Bresche', 'Schiff', 'Sorte', 'Kiel', 'Umfrage', 'Blume', 'Kummer', 'College', 'Unkraut', 'Königin', 'Abweichung', 'Sahne', 'Kind', 'Ritter', 'Matt', 'Post', 'Katholik', 'Erkenntnis', 'Binse', 'Stoß', 'Falte', 'Wahl', 'Leicht', 'Finsternis', 'Gewölbe', 'Ungewiss', 'Schwierig', 'Reisebus', 'Assistent', 'Angelegenheit', 'Vehikel', 'Rest', 'Vor', 'Anwalt', 'Wahrheit', 'Fährte', 'Farbe', 'Dur', 'Ziegel', 'Konstituiert', 'Gewalt', 'Reise', 'Spirale', 'Signal', 'Glocke', 'Heilig', 'Verharrt', 'Lob', 'Zusammenhang', 'Maut', 'Zimmer', 'Nett', 'Hals', 'Verfahren', 'Maske', 'Fleisch', 'Kur', 'Tätlich', 'Zerstörung', 'Ein', 'Bürger', 'Glaubt', 'Versuch', 'Anatomie']
+print(f"words to search {len(sample_500)}")
+for i, word in enumerate(sample_500):
+    print(i)
+    try:
+        result = dbot.search_word(word)
+    except NotImplementedError:
+        print("Translation error")
+        print(word)
+        continue
+    except DeutscherBotException:
+        print(f"Exception for word {word}")
+        continue
+        
+    definition = dbot.prepare_comment(result)
+    print(definition)
+    #  post.reply(definition)
 """
